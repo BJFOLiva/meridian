@@ -1,0 +1,21 @@
+[Unit]
+Description=Meridian City web and WebSocket server
+After=network.target
+
+[Service]
+Type=simple
+User=meridian
+Group=meridian
+WorkingDirectory=/opt/meridian-city
+EnvironmentFile=/opt/meridian-city/.env
+ExecStart=/usr/bin/node /opt/meridian-city/server/game-server.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/meridian-city
+
+[Install]
+WantedBy=multi-user.target

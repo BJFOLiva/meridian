@@ -1,0 +1,20 @@
+{
+  "name": "meridian-city-online",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Production hosting package for Meridian City with a WebSocket multiplayer foundation.",
+  "type": "module",
+  "scripts": {
+    "start": "node server/game-server.js",
+    "dev": "NODE_ENV=development node --watch server/game-server.js",
+    "check": "node --check server/game-server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "helmet": "^8.1.0",
+    "ws": "^8.18.3"
+  }
+}
