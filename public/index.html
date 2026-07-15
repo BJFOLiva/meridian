@@ -578,7 +578,7 @@ function firePlayer(dt){
   player.a = aim;
   if(w.melee){
     if(player.veh) return;
-    player.fireCd = 1/w.rate; SND.punch();
+    player.fireCd = 1/w.rate; SND.punch(); NET.sendAttack(player.weapon,aim);
     // hit nearest ped/cop in front
     const hx = ox+Math.cos(aim)*22, hy = oy+Math.sin(aim)*22;
     let hit=false;
@@ -603,6 +603,7 @@ function firePlayer(dt){
   player.fireCd = 1/w.rate;
   player.ammo[player.weapon]--;
   SND.shot(w.snd);
+  NET.sendAttack(player.weapon,aim);
   const spawnR = player.veh ? player.veh.spec.wid*0.7 : 14;
   for(let i=0;i<w.shots;i++){
     const a = aim + rand(-w.spread, w.spread) + (player.veh?rand(-.06,.06):0);
@@ -1720,6 +1721,8 @@ function visibleChunks(){
 const NET = (()=>{
   const remotes = new Map();
   const netVehicles = new Map();
+  const netProjectiles = new Map();
+  let selfAlive=true;
   const statusEl = document.getElementById('netStatus');
   let ws=null, selfId=null, reconnectT=null, sendAccumulator=0, connected=false, pendingClaim=null;
   let playerName=localStorage.getItem('meridianPlayerName') || ('Player '+Math.floor(100+Math.random()*900));
@@ -1735,26 +1738,30 @@ const NET = (()=>{
     ws.addEventListener('message',ev=>{
       let msg;try{msg=JSON.parse(ev.data)}catch{return;}
       if(msg.type==='welcome'){
-        selfId=msg.id;for(const p of msg.players||[])ingestPlayer(p,true);ingestEntities(msg.entities,true);
+        selfId=msg.id;for(const p of msg.players||[]){if(p.id===selfId)ingestSelf(p);else ingestPlayer(p,true);}ingestEntities(msg.entities,true);
       }else if(msg.type==='snapshot'){
-        const seen=new Set();for(const p of msg.players||[]){seen.add(p.id);ingestPlayer(p,false);}for(const id of remotes.keys())if(!seen.has(id))remotes.delete(id);
+        const seen=new Set();for(const p of msg.players||[]){seen.add(p.id);if(p.id===selfId)ingestSelf(p);else ingestPlayer(p,false);}for(const id of remotes.keys())if(!seen.has(id))remotes.delete(id);
         ingestEntities(msg.entities,false);
       }else if(msg.type==='playerJoined'||msg.type==='playerUpdated')ingestPlayer(msg.player,false);
       else if(msg.type==='playerLeft')remotes.delete(msg.id);
       else if(msg.type==='entityUpdated')ingestVehicle(msg.entity,false);
       else if(msg.type==='vehicleClaimed')activateClaimedVehicle(msg.vehicle);
+      else if(msg.type==='playerHit'){player.hp=msg.hp;player.armor=msg.armor;player.hurtT=.25;SND.hurt();}
+      else if(msg.type==='killFeed')toast((msg.killer||'Someone')+' eliminated '+(msg.victim||'a player'));
+      else if(msg.type==='respawn')ingestSelf(msg.player);
       else if(msg.type==='error'){pendingClaim=null;toast(msg.message||'Network error');}
     });
     ws.addEventListener('close',()=>{connected=false;selfId=null;pendingClaim=null;setStatus('ONLINE: RECONNECTING…');scheduleReconnect();});
     ws.addEventListener('error',()=>{try{ws.close()}catch{}});
   }
   function scheduleReconnect(){clearTimeout(reconnectT);reconnectT=setTimeout(connect,2000);}
+  function ingestSelf(p){if(!p)return;player.hp=clamp(Number(p.hp)||0,0,100);player.armor=clamp(Number(p.armor)||0,0,100);const alive=p.alive!==false;if(!alive&&selfAlive){selfAlive=false;if(state==='play')die('WASTED');}if(alive&&!selfAlive){selfAlive=true;player.x=Number(p.x)||HOSPITAL.x;player.y=Number(p.y)||HOSPITAL.y;player.hp=100;if(state==='dead')setState('play');}}
   function ingestPlayer(p,immediate){
     if(!p||p.id===selfId)return;let r=remotes.get(p.id);
-    if(!r){r={id:p.id,name:p.name||'Player',x:p.x,y:p.y,tx:p.x,ty:p.y,heading:p.heading||0,th:p.heading||0,inVehicle:!!p.inVehicle,vehicleType:p.vehicleType||null,lastSeen:performance.now()};remotes.set(p.id,r);}
-    r.name=p.name||r.name;r.tx=Number(p.x)||0;r.ty=Number(p.y)||0;r.th=Number(p.heading)||0;r.inVehicle=!!p.inVehicle;r.vehicleType=p.vehicleType||null;r.lastSeen=performance.now();if(immediate){r.x=r.tx;r.y=r.ty;r.heading=r.th;}
+    if(!r){r={id:p.id,name:p.name||'Player',x:p.x,y:p.y,tx:p.x,ty:p.y,heading:p.heading||0,th:p.heading||0,inVehicle:!!p.inVehicle,vehicleType:p.vehicleType||null,hp:Number(p.hp)||100,alive:p.alive!==false,lastSeen:performance.now()};remotes.set(p.id,r);}
+    r.name=p.name||r.name;r.tx=Number(p.x)||0;r.ty=Number(p.y)||0;r.th=Number(p.heading)||0;r.inVehicle=!!p.inVehicle;r.vehicleType=p.vehicleType||null;r.hp=Number(p.hp)||0;r.alive=p.alive!==false;r.lastSeen=performance.now();if(immediate){r.x=r.tx;r.y=r.ty;r.heading=r.th;}
   }
-  function ingestEntities(entities,immediate){if(!entities)return;const seen=new Set();for(const v of entities.vehicles||[]){seen.add(v.id);ingestVehicle(v,immediate);}for(const id of netVehicles.keys())if(!seen.has(id))netVehicles.delete(id);}
+  function ingestEntities(entities,immediate){if(!entities)return;const seen=new Set();for(const v of entities.vehicles||[]){seen.add(v.id);ingestVehicle(v,immediate);}for(const id of netVehicles.keys())if(!seen.has(id))netVehicles.delete(id);const ps=new Set();for(const q of entities.projectiles||[]){ps.add(q.id);let r=netProjectiles.get(q.id);if(!r){r={...q};netProjectiles.set(q.id,r);}else Object.assign(r,q);}for(const id of netProjectiles.keys())if(!ps.has(id))netProjectiles.delete(id);}
   function ingestVehicle(v,immediate){
     if(!v||v.entityType!=='vehicle')return;let r=netVehicles.get(v.id);
     if(!r){r={...v,tx:v.x,ty:v.y,th:v.heading||0,x:v.x,y:v.y,heading:v.heading||0};netVehicles.set(v.id,r);}
@@ -1773,6 +1780,7 @@ const NET = (()=>{
     for(const v of netVehicles.values()){if(v.ownerId&&v.ownerId!==selfId)continue;const d=dist(player.x,player.y,v.x,v.y);if(d<bd){bd=d;best=v;}}
     if(!best)return false;pendingClaim=best.id;sendMsg({type:'claimVehicle',vehicleId:best.id});return true;
   }
+  function sendAttack(weapon,angle){sendMsg({type:'attack',weapon,angle});}
   function releaseVehicle(v){if(!v||!v.networkId)return;sendMsg({type:'releaseVehicle',vehicleId:v.networkId,speed:v.speed||0});const nv=netVehicles.get(v.networkId);if(nv)nv.ownerId=null;v.dead=true;}
   function update(dt){
     for(const [id,r] of remotes){const k=1-Math.exp(-12*dt);r.x=lerp(r.x,r.tx,k);r.y=lerp(r.y,r.ty,k);r.heading=angLerp(r.heading,r.th,k);if(performance.now()-r.lastSeen>10000)remotes.delete(id);}
@@ -1784,10 +1792,11 @@ const NET = (()=>{
   }
   function drawNetVehicle2D(v){cx.save();cx.translate(v.x,v.y);cx.rotate(v.heading);cx.fillStyle=v.color||'#7d8087';rr(-27,-13,54,26,5);cx.fill();cx.fillStyle='#19242c';rr(-8,-10,22,20,3);cx.fill();cx.restore();}
   function draw2D(){
+    for(const p of netProjectiles.values()){cx.fillStyle='#ffd98a';cx.beginPath();cx.arc(p.x,p.y,2.5,0,TAU);cx.fill();}
     for(const v of netVehicles.values()){if(v.ownerId===selfId&&player.veh&&player.veh.networkId===v.id)continue;drawNetVehicle2D(v);}
-    for(const r of remotes.values()){if(r.inVehicle){cx.save();cx.translate(r.x,r.y);cx.rotate(r.heading);cx.fillStyle='#29d8c5';rr(-25,-12,50,24,5);cx.fill();cx.fillStyle='#19242c';rr(-8,-9,21,18,3);cx.fill();cx.restore();}else drawGuy(r.x,r.y,r.heading,timeNow*6,'#29d8c5','#d8b08c');cx.font='bold 11px Arial';cx.textAlign='center';cx.fillStyle='rgba(0,0,0,.65)';cx.fillText(r.name,r.x+1,r.y-25+1);cx.fillStyle='#fff';cx.fillText(r.name,r.x,r.y-25);}
+    for(const r of remotes.values()){if(!r.alive)continue;if(r.inVehicle){cx.save();cx.translate(r.x,r.y);cx.rotate(r.heading);cx.fillStyle='#29d8c5';rr(-25,-12,50,24,5);cx.fill();cx.fillStyle='#19242c';rr(-8,-9,21,18,3);cx.fill();cx.restore();}else drawGuy(r.x,r.y,r.heading,timeNow*6,'#29d8c5','#d8b08c');cx.font='bold 11px Arial';cx.textAlign='center';cx.fillStyle='rgba(0,0,0,.65)';cx.fillText(r.name,r.x+1,r.y-25+1);cx.fillStyle='#fff';cx.fillText(r.name,r.x,r.y-25);}
   }
-  connect();return {remotes,netVehicles,update,draw2D,tryClaimNearest,releaseVehicle,get selfId(){return selfId},get connected(){return connected}};
+  connect();return {remotes,netVehicles,netProjectiles,update,draw2D,tryClaimNearest,releaseVehicle,sendAttack,get selfId(){return selfId},get connected(){return connected}};
 })();
 
 // ---------- WebGL Renderer V3.1 — chunked districts and material foundation ----------
@@ -1929,8 +1938,9 @@ const GL3D = window.GL3D = (()=>{
       if(v.ownerId===NET.selfId&&player.veh&&player.veh.networkId===v.id) continue;
       shadow(v.x,v.y,52,26,-v.heading,.22);box(v.x,v.y,52,6,26,v.color||'#7d8087',-v.heading,3);box(v.x,v.y,22,5,18,'#202a35',-v.heading,9);
     }
-    // Remote online players. The server synchronizes position and vehicle state.
-    for(const r of NET.remotes.values()){
+    // Shared projectiles and remote online players.
+    for(const p of NET.netProjectiles.values())box(p.x,p.y,5,3,5,'#ffd98a',0,8);
+    for(const r of NET.remotes.values()){if(!r.alive)continue;
       if(r.inVehicle){
         shadow(r.x,r.y,48,24,-r.heading,.24);box(r.x,r.y,48,6,24,'#29d8c5',-r.heading,3);box(r.x,r.y,22,5,17,'#202a35',-r.heading,9);
       }else person(r.x,r.y,'#29d8c5','#d8b08c',1);

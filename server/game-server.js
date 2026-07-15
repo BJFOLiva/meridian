@@ -26,7 +26,7 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false
 }));
 app.get('/healthz', (_req, res) => {
-  res.json({ ok: true, players: players.size, vehicles: vehicles.size, uptimeSeconds: Math.floor(process.uptime()) });
+  res.json({ ok: true, players: players.size, vehicles: vehicles.size, projectiles: projectiles.size, uptimeSeconds: Math.floor(process.uptime()) });
 });
 app.use(express.static(publicDir, {
   extensions: ['html'],
@@ -38,6 +38,8 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 16 * 1024 });
 const players = new Map();
 const vehicles = new Map();
+const projectiles = new Map();
+let projectileSeq = 0;
 
 const VEHICLE_TYPES = ['Hatch', 'Sedan', 'Bullet', 'Taxi', 'Panelvan'];
 const VEHICLE_COLORS = ['#b6402f','#3e6db5','#c8b447','#4d9a68','#8e4fa8','#c26d29','#7d8087','#d8d4c8','#30343c','#a83a5f'];
@@ -110,9 +112,16 @@ function publicPlayer(p) {
     heading: p.heading,
     inVehicle: p.inVehicle,
     vehicleType: p.vehicleType,
+    hp: p.hp, armor: p.armor, kills: p.kills, deaths: p.deaths, alive: p.alive,
     updatedAt: p.updatedAt
   };
 }
+
+function publicProjectile(p){return {id:p.id,entityType:'projectile',ownerId:p.ownerId,x:p.x,y:p.y,vx:p.vx,vy:p.vy,ttl:p.ttl};}
+const WEAPON_NET=[{rate:2.4,damage:28,melee:true,range:38},{rate:3.2,damage:24,speed:840,shots:1,spread:.035},{rate:10,damage:13,speed:860,shots:1,spread:.10},{rate:1.1,damage:11,speed:760,shots:6,spread:.26}];
+function applyPlayerDamage(t,dmg,attackerId){if(!t||!t.alive)return;let d=clamp(Number(dmg)||0,0,100);if(t.armor>0){const a=Math.min(t.armor,d*.6);t.armor-=a;d-=a;}t.hp=clamp(t.hp-d,0,100);send(t.ws,{type:'playerHit',hp:t.hp,armor:t.armor,attackerId});if(t.hp>0)return;t.alive=false;t.deaths++;t.respawnAt=Date.now()+3000;t.inVehicle=false;t.vehicleType=null;for(const v of vehicles.values())if(v.ownerId===t.id)v.ownerId=null;const a=players.get(attackerId);if(a&&a.id!==t.id)a.kills++;broadcast({type:'killFeed',killer:a?.name||'The city',victim:t.name});}
+function spawnProjectile(owner,w,a){const id=`projectile-${++projectileSeq}`;const o=owner.inVehicle?22:14;projectiles.set(id,{id,ownerId:owner.id,x:owner.x+Math.cos(a)*o,y:owner.y+Math.sin(a)*o,vx:Math.cos(a)*w.speed,vy:Math.sin(a)*w.speed,damage:w.damage,ttl:.9});}
+
 
 wss.on('connection', (ws, request) => {
   if (players.size >= MAX_PLAYERS) {
@@ -133,7 +142,7 @@ wss.on('connection', (ws, request) => {
     vehicleType: null,
     updatedAt: now,
     lastInputAt: now,
-    remoteAddress: request.socket.remoteAddress
+    remoteAddress: request.socket.remoteAddress, hp:100, armor:0, kills:0, deaths:0, alive:true, respawnAt:0, lastAttackAt:0, ws
   };
   players.set(id, player);
 
@@ -143,7 +152,7 @@ wss.on('connection', (ws, request) => {
     tickRate: TICK_RATE,
     world: { width: WORLD_WIDTH, height: WORLD_HEIGHT },
     players: [...players.values()].map(publicPlayer),
-    entities: { vehicles: [...vehicles.values()].map(publicVehicle) }
+    entities: { vehicles: [...vehicles.values()].map(publicVehicle), projectiles:[...projectiles.values()].map(publicProjectile) }
   });
   broadcast({ type: 'playerJoined', player: publicPlayer(player) }, ws);
 
@@ -210,8 +219,16 @@ wss.on('connection', (ws, request) => {
       return;
     }
 
+
+    if(msg.type==='attack'){
+      if(!player.alive)return;const wi=clamp(Number.parseInt(msg.weapon,10)||0,0,WEAPON_NET.length-1),w=WEAPON_NET[wi],nowMs=Date.now();if(nowMs-player.lastAttackAt<1000/w.rate*.82)return;player.lastAttackAt=nowMs;const a=Number.isFinite(Number(msg.angle))?Number(msg.angle):player.heading;
+      if(w.melee){let best=null,bd=w.range;for(const t of players.values()){if(t.id===id||!t.alive||t.inVehicle)continue;const dx=t.x-player.x,dy=t.y-player.y,d=Math.hypot(dx,dy);if(d>=bd)continue;let da=Math.atan2(dy,dx)-a;while(da>Math.PI)da-=Math.PI*2;while(da<-Math.PI)da+=Math.PI*2;if(Math.abs(da)>.85)continue;best=t;bd=d;}if(best){best.x=clamp(best.x+Math.cos(a)*12,0,WORLD_WIDTH);best.y=clamp(best.y+Math.sin(a)*12,0,WORLD_HEIGHT);applyPlayerDamage(best,w.damage,id);}}
+      else for(let i=0;i<w.shots;i++)spawnProjectile(player,w,a+(Math.random()*2-1)*w.spread);return;
+    }
+
     if (msg.type !== 'state') return;
 
+    if(!player.alive)return;
     const nowMs = Date.now();
     const dt = clamp((nowMs - player.lastInputAt) / 1000, 1 / 120, 1);
     player.lastInputAt = nowMs;
@@ -250,13 +267,10 @@ wss.on('connection', (ws, request) => {
 });
 
 const interval = setInterval(() => {
-  if (players.size === 0) return;
-  broadcast({
-    type: 'snapshot',
-    serverTime: Date.now(),
-    players: [...players.values()].map(publicPlayer),
-    entities: { vehicles: [...vehicles.values()].map(publicVehicle) }
-  });
+  const now=Date.now(),dt=1/TICK_RATE;
+  for(const p of players.values())if(!p.alive&&p.respawnAt&&now>=p.respawnAt){p.alive=true;p.hp=100;p.armor=0;p.x=2268;p.y=2106;p.heading=0;p.respawnAt=0;p.updatedAt=now;send(p.ws,{type:'respawn',player:publicPlayer(p)});}
+  for(const [id,q] of projectiles){q.ttl-=dt;q.x+=q.vx*dt;q.y+=q.vy*dt;let remove=q.ttl<=0||q.x<0||q.y<0||q.x>WORLD_WIDTH||q.y>WORLD_HEIGHT;if(!remove)for(const t of players.values()){if(t.id===q.ownerId||!t.alive)continue;if(Math.hypot(t.x-q.x,t.y-q.y)<=(t.inVehicle?25:12)){applyPlayerDamage(t,q.damage,q.ownerId);remove=true;break;}}if(remove)projectiles.delete(id);}
+  if(players.size===0)return;broadcast({type:'snapshot',serverTime:now,players:[...players.values()].map(publicPlayer),entities:{vehicles:[...vehicles.values()].map(publicVehicle),projectiles:[...projectiles.values()].map(publicProjectile)}});
 }, Math.round(1000 / TICK_RATE));
 interval.unref();
 

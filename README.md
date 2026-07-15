@@ -147,3 +147,15 @@ This build adds the first server-owned world entities: shared vehicles.
 - Shared vehicles render in both WebGL and Canvas 2D modes.
 
 This is the foundation for moving police, pedestrians, pickups, bullets, and explosions into the same replicated entity protocol.
+
+## PvP interactions
+
+This build adds server-authoritative player combat:
+
+- Fists and all existing firearms can damage other connected players.
+- The server validates attack rate, melee range, projectile movement, hits, health, armor, deaths, and respawns.
+- Shared projectiles are replicated to all clients.
+- Eliminations appear through the in-game notification feed.
+- Defeated players respawn at Meridian General after three seconds.
+
+Combat is intentionally an initial foundation. Team rules, safe zones, assists, scoreboards, and vehicle collision damage can be added on top of the same protocol.
