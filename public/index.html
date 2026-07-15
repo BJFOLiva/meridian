@@ -49,11 +49,16 @@ h2.ptitle{font-family:"Arial Black",Impact,sans-serif;font-style:italic;text-tra
 .touchwarn{display:none;color:var(--mag);font-size:12px;margin-top:14px;letter-spacing:.06em}
 .shopgrid{display:grid;grid-template-columns:minmax(220px,360px);gap:10px;width:min(420px,88vw);margin:4px 0 18px}.shopitem{display:grid;grid-template-columns:1fr auto;gap:8px 14px;align-items:center;text-align:left;padding:12px 14px;border:1px solid #34374a;background:rgba(20,22,29,.88)}.shopitem strong{font-family:"Arial Black",Impact,sans-serif;letter-spacing:.06em}.shopitem span{font-size:12px;color:var(--dim)}.shopitem button{grid-row:1/3;grid-column:2;padding:9px 14px;font-size:12px}.shopcash{font-family:"Arial Black",Impact,sans-serif;color:#7ddf9a;font-size:22px;margin:-8px 0 16px}.locked{opacity:.48}
 .homegrid{display:grid;grid-template-columns:repeat(2,minmax(170px,260px));gap:12px;width:min(560px,92vw);margin:6px 0 18px}.homecard{padding:16px;border:1px solid #34374a;background:rgba(20,22,29,.9);text-align:left}.homecard strong{font-family:"Arial Black",Impact,sans-serif;letter-spacing:.06em}.homecard p{font-size:12px;color:var(--dim);line-height:1.45;margin:7px 0 12px}.homecard .btn{font-size:11px;padding:9px 13px}.homestatus{font-size:13px;color:#c6c9d2;max-width:550px;line-height:1.55;margin:-8px 0 15px}@media(max-width:560px){.homegrid{grid-template-columns:1fr}}
+
+#netStatus{position:fixed;right:14px;top:14px;z-index:8;padding:7px 10px;border:1px solid rgba(255,255,255,.18);background:rgba(10,12,17,.78);color:#c6c9d2;font:11px ui-monospace,Menlo,Consolas,monospace;letter-spacing:.05em;pointer-events:none}
+#netStatus.online{color:#7ddf9a;border-color:rgba(125,223,154,.45)}
+#netStatus.offline{color:#ff8b8b;border-color:rgba(255,139,139,.4)}
 </style>
 </head>
 <body>
 <canvas id="glgame"></canvas>
 <canvas id="game"></canvas>
+<div id="netStatus" class="offline">ONLINE: CONNECTING…</div>
 
 <div id="menu" class="overlay">
   <p class="strap">Anthropic Arcade Presents</p>
@@ -1708,6 +1713,83 @@ function visibleChunks(){
     for(let bx=Math.max(0,cx0-RENDER_CHUNK_RADIUS);bx<=Math.min(6,cx0+RENDER_CHUNK_RADIUS);bx++) out.push({bx,by,district:districtAtBlock(bx,by)});
   return out;
 }
+// ---------- Online multiplayer client (/ws) ----------
+const NET = (()=>{
+  const remotes = new Map();
+  const statusEl = document.getElementById('netStatus');
+  let ws=null, selfId=null, reconnectT=null, sendAccumulator=0, connected=false;
+  let playerName=localStorage.getItem('meridianPlayerName') || ('Player '+Math.floor(100+Math.random()*900));
+  localStorage.setItem('meridianPlayerName',playerName);
+
+  function setStatus(text,online=false){
+    if(!statusEl)return;
+    statusEl.textContent=text;
+    statusEl.className=online?'online':'offline';
+  }
+  function socketUrl(){
+    const proto=location.protocol==='https:'?'wss:':'ws:';
+    return proto+'//'+location.host+'/ws';
+  }
+  function connect(){
+    clearTimeout(reconnectT);
+    setStatus('ONLINE: CONNECTING…');
+    try{ ws=new WebSocket(socketUrl()); }catch(e){ scheduleReconnect(); return; }
+    ws.addEventListener('open',()=>{
+      connected=true; setStatus('ONLINE: CONNECTED',true);
+      ws.send(JSON.stringify({type:'hello',name:playerName}));
+    });
+    ws.addEventListener('message',ev=>{
+      let msg; try{msg=JSON.parse(ev.data)}catch{return;}
+      if(msg.type==='welcome'){
+        selfId=msg.id;
+        for(const p of msg.players||[]) ingest(p,true);
+      }else if(msg.type==='snapshot'){
+        const seen=new Set();
+        for(const p of msg.players||[]){seen.add(p.id);ingest(p,false);}
+        for(const id of remotes.keys()) if(!seen.has(id)) remotes.delete(id);
+      }else if(msg.type==='playerJoined'||msg.type==='playerUpdated') ingest(msg.player,false);
+      else if(msg.type==='playerLeft') remotes.delete(msg.id);
+      else if(msg.type==='error') toast(msg.message||'Network error');
+    });
+    ws.addEventListener('close',()=>{connected=false;selfId=null;setStatus('ONLINE: RECONNECTING…');scheduleReconnect();});
+    ws.addEventListener('error',()=>{ try{ws.close()}catch{} });
+  }
+  function scheduleReconnect(){ clearTimeout(reconnectT); reconnectT=setTimeout(connect,2000); }
+  function ingest(p,immediate){
+    if(!p||p.id===selfId)return;
+    let r=remotes.get(p.id);
+    if(!r){
+      r={id:p.id,name:p.name||'Player',x:p.x,y:p.y,tx:p.x,ty:p.y,heading:p.heading||0,th:p.heading||0,inVehicle:!!p.inVehicle,vehicleType:p.vehicleType||null,lastSeen:performance.now()};
+      remotes.set(p.id,r);
+    }
+    r.name=p.name||r.name;r.tx=Number(p.x)||0;r.ty=Number(p.y)||0;r.th=Number(p.heading)||0;
+    r.inVehicle=!!p.inVehicle;r.vehicleType=p.vehicleType||null;r.lastSeen=performance.now();
+    if(immediate){r.x=r.tx;r.y=r.ty;r.heading=r.th;}
+  }
+  function update(dt){
+    for(const [id,r] of remotes){
+      const k=1-Math.exp(-12*dt);r.x=lerp(r.x,r.tx,k);r.y=lerp(r.y,r.ty,k);r.heading=angLerp(r.heading,r.th,k);
+      if(performance.now()-r.lastSeen>10000) remotes.delete(id);
+    }
+    if(!connected||!ws||ws.readyState!==WebSocket.OPEN)return;
+    sendAccumulator+=dt;
+    if(sendAccumulator<0.05)return;
+    sendAccumulator=0;
+    const v=player.veh;
+    ws.send(JSON.stringify({type:'state',x:v?v.x:player.x,y:v?v.y:player.y,heading:v?v.heading:player.a,inVehicle:!!v,vehicleType:v?v.spec.n:null}));
+  }
+  function draw2D(){
+    for(const r of remotes.values()){
+      if(r.inVehicle){
+        cx.save();cx.translate(r.x,r.y);cx.rotate(r.heading);cx.fillStyle='#29d8c5';rr(-25,-12,50,24,5);cx.fill();cx.fillStyle='#19242c';rr(-8,-9,21,18,3);cx.fill();cx.restore();
+      }else drawGuy(r.x,r.y,r.heading,timeNow*6,'#29d8c5','#d8b08c');
+      cx.font='bold 11px Arial';cx.textAlign='center';cx.fillStyle='rgba(0,0,0,.65)';cx.fillText(r.name,r.x+1,r.y-25+1);cx.fillStyle='#fff';cx.fillText(r.name,r.x,r.y-25);
+    }
+  }
+  connect();
+  return {remotes,update,draw2D,get connected(){return connected}};
+})();
+
 // ---------- WebGL Renderer V3.1 — chunked districts and material foundation ----------
 const GL3D = window.GL3D = (()=>{
   const canvas=document.getElementById('glgame');
@@ -1842,6 +1924,12 @@ const GL3D = window.GL3D = (()=>{
     for(const p of peds)if(p.state!=='dead'&&dist(p.x,p.y,cam.x,cam.y)<1050)person(p.x,p.y,p.shirt,p.skin,.9);
     for(const c of cops)if(dist(c.x,c.y,cam.x,cam.y)<1050)person(c.x,c.y,'#2c4a8c','#caa07a',.95);
     if(state!=='menu'&&!player.veh)person(player.x,player.y,'#343840','#caa07a',1);
+    // Remote online players. The server synchronizes position and vehicle state.
+    for(const r of NET.remotes.values()){
+      if(r.inVehicle){
+        shadow(r.x,r.y,48,24,-r.heading,.24);box(r.x,r.y,48,6,24,'#29d8c5',-r.heading,3);box(r.x,r.y,22,5,17,'#202a35',-r.heading,9);
+      }else person(r.x,r.y,'#29d8c5','#d8b08c',1);
+    }
     // Low-profile landmark beacons instead of giant pylons.
     for(const [pt,col] of [[HOME,'#29d8c5'],[GUNSHOP,'#d08a2f'],[HOSPITAL,'#c94b4b'],[STATION,'#3f6fae']]){box(pt.x,pt.y,24,2,24,col,0,3);box(pt.x,pt.y,6,20,6,col,0,5);}
   }
@@ -1895,6 +1983,7 @@ function render(){
       cx.globalAlpha=1;
     }
   }
+  NET.draw2D();
   cx.strokeStyle='#ffe9a6'; cx.lineWidth=2;
   for(const b of bullets){
     cx.beginPath(); cx.moveTo(b.x,b.y); cx.lineTo(b.x-b.vx*0.014,b.y-b.vy*0.014); cx.stroke();
@@ -2212,6 +2301,7 @@ function frame(now){
     ambient(dt);
   }
   else if(state==='dead'){ deadT+=dt; ambient(dt); if(deadT>3) respawn(); }
+  NET.update(dt);
   render();
   SND.upd(dt,timeNow);
 }

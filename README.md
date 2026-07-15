@@ -119,3 +119,17 @@ Copy `.env.example` to `.env` and adjust:
 - Use SSH keys and disable password-based root login after confirming key access.
 - Keep Ubuntu and Node.js security updates current.
 - Back up save databases once persistent accounts/world state are added.
+
+## Browser multiplayer client
+
+The game client now connects automatically to the same host at `/ws`:
+
+- HTTPS deployments use `wss://<host>/ws`.
+- Local HTTP development uses `ws://<host>/ws`.
+- The client reconnects automatically after interruption.
+- Local player state is sent at up to 20 updates per second.
+- Server snapshots are interpolated for smoother remote movement.
+- Remote players render in both WebGL and fallback Canvas 2D modes.
+- The top-right network badge shows connection status.
+
+Open the deployed URL in two browser windows or on two devices to test visible player synchronization.

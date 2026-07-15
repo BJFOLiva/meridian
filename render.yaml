@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: meridian-city-online
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MAX_PLAYERS
+        value: 32
+      - key: TICK_RATE
+        value: 15
+      - key: MAX_SPEED
+        value: 650
