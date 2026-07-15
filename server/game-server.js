@@ -26,7 +26,7 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false
 }));
 app.get('/healthz', (_req, res) => {
-  res.json({ ok: true, players: players.size, uptimeSeconds: Math.floor(process.uptime()) });
+  res.json({ ok: true, players: players.size, vehicles: vehicles.size, uptimeSeconds: Math.floor(process.uptime()) });
 });
 app.use(express.static(publicDir, {
   extensions: ['html'],
@@ -37,6 +37,32 @@ app.get('*', (_req, res) => res.sendFile(path.join(publicDir, 'index.html')));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 16 * 1024 });
 const players = new Map();
+const vehicles = new Map();
+
+const VEHICLE_TYPES = ['Hatch', 'Sedan', 'Bullet', 'Taxi', 'Panelvan'];
+const VEHICLE_COLORS = ['#b6402f','#3e6db5','#c8b447','#4d9a68','#8e4fa8','#c26d29','#7d8087','#d8d4c8','#30343c','#a83a5f'];
+
+function seedVehicles() {
+  if (vehicles.size) return;
+  let index = 0;
+  for (let by = 0; by < 7; by++) {
+    for (let bx = 0; bx < 7; bx++) {
+      if ((bx + by) % 2 !== 0) continue;
+      const vertical = index % 2 === 0;
+      const x = vertical ? bx * 648 + 22 : bx * 648 + 300 + (index % 3) * 55;
+      const y = vertical ? by * 648 + 300 + (index % 3) * 55 : by * 648 + 22;
+      const id = `vehicle-${index + 1}`;
+      vehicles.set(id, {
+        id, entityType: 'vehicle', type: VEHICLE_TYPES[index % VEHICLE_TYPES.length],
+        color: VEHICLE_COLORS[index % VEHICLE_COLORS.length],
+        x: clamp(x, 30, WORLD_WIDTH - 30), y: clamp(y, 30, WORLD_HEIGHT - 30),
+        heading: vertical ? Math.PI / 2 : 0, speed: 0, hp: 100, ownerId: null, updatedAt: Date.now()
+      });
+      index++;
+    }
+  }
+}
+seedVehicles();
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -56,6 +82,23 @@ function broadcast(payload, except = null) {
   for (const client of wss.clients) {
     if (client !== except && client.readyState === WebSocket.OPEN) client.send(encoded);
   }
+}
+
+
+function publicVehicle(v) {
+  return {
+    id: v.id,
+    entityType: 'vehicle',
+    type: v.type,
+    color: v.color,
+    x: v.x,
+    y: v.y,
+    heading: v.heading,
+    speed: v.speed,
+    hp: v.hp,
+    ownerId: v.ownerId,
+    updatedAt: v.updatedAt
+  };
 }
 
 function publicPlayer(p) {
@@ -99,7 +142,8 @@ wss.on('connection', (ws, request) => {
     id,
     tickRate: TICK_RATE,
     world: { width: WORLD_WIDTH, height: WORLD_HEIGHT },
-    players: [...players.values()].map(publicPlayer)
+    players: [...players.values()].map(publicPlayer),
+    entities: { vehicles: [...vehicles.values()].map(publicVehicle) }
   });
   broadcast({ type: 'playerJoined', player: publicPlayer(player) }, ws);
 
@@ -115,6 +159,54 @@ wss.on('connection', (ws, request) => {
     if (msg.type === 'hello') {
       player.name = cleanName(msg.name);
       broadcast({ type: 'playerUpdated', player: publicPlayer(player) });
+      return;
+    }
+
+    if (msg.type === 'claimVehicle') {
+      const vehicle = vehicles.get(String(msg.vehicleId || ''));
+      if (!vehicle) return send(ws, { type: 'error', code: 'NO_VEHICLE', message: 'Vehicle no longer exists.' });
+      if (vehicle.ownerId && vehicle.ownerId !== id) return send(ws, { type: 'error', code: 'VEHICLE_TAKEN', message: 'Someone else is using that vehicle.' });
+      if (Math.hypot(player.x - vehicle.x, player.y - vehicle.y) > 90) return send(ws, { type: 'error', code: 'TOO_FAR', message: 'Move closer to the vehicle.' });
+      vehicle.ownerId = id;
+      vehicle.updatedAt = Date.now();
+      player.inVehicle = true;
+      player.vehicleType = vehicle.type;
+      send(ws, { type: 'vehicleClaimed', vehicle: publicVehicle(vehicle) });
+      broadcast({ type: 'entityUpdated', entity: publicVehicle(vehicle) }, ws);
+      return;
+    }
+
+    if (msg.type === 'releaseVehicle') {
+      const vehicle = vehicles.get(String(msg.vehicleId || ''));
+      if (!vehicle || vehicle.ownerId !== id) return;
+      vehicle.ownerId = null;
+      vehicle.speed = Number.isFinite(Number(msg.speed)) ? clamp(Number(msg.speed), -500, 500) : 0;
+      vehicle.updatedAt = Date.now();
+      player.inVehicle = false;
+      player.vehicleType = null;
+      broadcast({ type: 'entityUpdated', entity: publicVehicle(vehicle) });
+      return;
+    }
+
+    if (msg.type === 'vehicleState') {
+      const vehicle = vehicles.get(String(msg.vehicleId || ''));
+      if (!vehicle || vehicle.ownerId !== id) return;
+      const nowMs = Date.now();
+      const dt = clamp((nowMs - vehicle.updatedAt) / 1000, 1 / 120, 1);
+      const requestedX = Number(msg.x), requestedY = Number(msg.y);
+      if (!Number.isFinite(requestedX) || !Number.isFinite(requestedY)) return;
+      const maxDistance = MAX_SPEED * dt + 60;
+      const dx = requestedX - vehicle.x, dy = requestedY - vehicle.y;
+      const distance = Math.hypot(dx, dy);
+      const scale = distance > maxDistance ? maxDistance / distance : 1;
+      vehicle.x = clamp(vehicle.x + dx * scale, 0, WORLD_WIDTH);
+      vehicle.y = clamp(vehicle.y + dy * scale, 0, WORLD_HEIGHT);
+      vehicle.heading = Number.isFinite(Number(msg.heading)) ? Number(msg.heading) : vehicle.heading;
+      vehicle.speed = Number.isFinite(Number(msg.speed)) ? clamp(Number(msg.speed), -500, 500) : vehicle.speed;
+      vehicle.hp = Number.isFinite(Number(msg.hp)) ? clamp(Number(msg.hp), 0, 250) : vehicle.hp;
+      vehicle.updatedAt = nowMs;
+      player.x = vehicle.x; player.y = vehicle.y; player.heading = vehicle.heading;
+      player.inVehicle = true; player.vehicleType = vehicle.type; player.updatedAt = nowMs;
       return;
     }
 
@@ -146,6 +238,9 @@ wss.on('connection', (ws, request) => {
 
   ws.on('close', () => {
     players.delete(id);
+    for (const vehicle of vehicles.values()) {
+      if (vehicle.ownerId === id) { vehicle.ownerId = null; vehicle.speed = 0; vehicle.updatedAt = Date.now(); }
+    }
     broadcast({ type: 'playerLeft', id });
   });
 
@@ -159,7 +254,8 @@ const interval = setInterval(() => {
   broadcast({
     type: 'snapshot',
     serverTime: Date.now(),
-    players: [...players.values()].map(publicPlayer)
+    players: [...players.values()].map(publicPlayer),
+    entities: { vehicles: [...vehicles.values()].map(publicVehicle) }
   });
 }, Math.round(1000 / TICK_RATE));
 interval.unref();

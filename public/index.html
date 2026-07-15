@@ -514,9 +514,12 @@ function tryEnterExit(){
     player.x = solidPx(ex,ey) ? v.x : ex;
     player.y = solidPx(ex,ey) ? v.y : ey;
     v.driver = null; v.speed *= 0.4;
+    if(v.networkId) NET.releaseVehicle(v);
     player.veh = null;
     return;
   }
+  // Server-owned shared vehicles get first claim priority.
+  if(NET.tryClaimNearest()) return;
   // nearest enterable vehicle
   let best=null, bd=64;
   for(const v of vehicles){
@@ -1716,78 +1719,75 @@ function visibleChunks(){
 // ---------- Online multiplayer client (/ws) ----------
 const NET = (()=>{
   const remotes = new Map();
+  const netVehicles = new Map();
   const statusEl = document.getElementById('netStatus');
-  let ws=null, selfId=null, reconnectT=null, sendAccumulator=0, connected=false;
+  let ws=null, selfId=null, reconnectT=null, sendAccumulator=0, connected=false, pendingClaim=null;
   let playerName=localStorage.getItem('meridianPlayerName') || ('Player '+Math.floor(100+Math.random()*900));
   localStorage.setItem('meridianPlayerName',playerName);
 
-  function setStatus(text,online=false){
-    if(!statusEl)return;
-    statusEl.textContent=text;
-    statusEl.className=online?'online':'offline';
-  }
-  function socketUrl(){
-    const proto=location.protocol==='https:'?'wss:':'ws:';
-    return proto+'//'+location.host+'/ws';
-  }
+  function setStatus(text,online=false){if(!statusEl)return;statusEl.textContent=text;statusEl.className=online?'online':'offline';}
+  function socketUrl(){const proto=location.protocol==='https:'?'wss:':'ws:';return proto+'//'+location.host+'/ws';}
+  function sendMsg(msg){if(connected&&ws&&ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify(msg));}
   function connect(){
-    clearTimeout(reconnectT);
-    setStatus('ONLINE: CONNECTING…');
-    try{ ws=new WebSocket(socketUrl()); }catch(e){ scheduleReconnect(); return; }
-    ws.addEventListener('open',()=>{
-      connected=true; setStatus('ONLINE: CONNECTED',true);
-      ws.send(JSON.stringify({type:'hello',name:playerName}));
-    });
+    clearTimeout(reconnectT);setStatus('ONLINE: CONNECTING…');
+    try{ws=new WebSocket(socketUrl());}catch(e){scheduleReconnect();return;}
+    ws.addEventListener('open',()=>{connected=true;setStatus('ONLINE: CONNECTED',true);sendMsg({type:'hello',name:playerName});});
     ws.addEventListener('message',ev=>{
-      let msg; try{msg=JSON.parse(ev.data)}catch{return;}
+      let msg;try{msg=JSON.parse(ev.data)}catch{return;}
       if(msg.type==='welcome'){
-        selfId=msg.id;
-        for(const p of msg.players||[]) ingest(p,true);
+        selfId=msg.id;for(const p of msg.players||[])ingestPlayer(p,true);ingestEntities(msg.entities,true);
       }else if(msg.type==='snapshot'){
-        const seen=new Set();
-        for(const p of msg.players||[]){seen.add(p.id);ingest(p,false);}
-        for(const id of remotes.keys()) if(!seen.has(id)) remotes.delete(id);
-      }else if(msg.type==='playerJoined'||msg.type==='playerUpdated') ingest(msg.player,false);
-      else if(msg.type==='playerLeft') remotes.delete(msg.id);
-      else if(msg.type==='error') toast(msg.message||'Network error');
+        const seen=new Set();for(const p of msg.players||[]){seen.add(p.id);ingestPlayer(p,false);}for(const id of remotes.keys())if(!seen.has(id))remotes.delete(id);
+        ingestEntities(msg.entities,false);
+      }else if(msg.type==='playerJoined'||msg.type==='playerUpdated')ingestPlayer(msg.player,false);
+      else if(msg.type==='playerLeft')remotes.delete(msg.id);
+      else if(msg.type==='entityUpdated')ingestVehicle(msg.entity,false);
+      else if(msg.type==='vehicleClaimed')activateClaimedVehicle(msg.vehicle);
+      else if(msg.type==='error'){pendingClaim=null;toast(msg.message||'Network error');}
     });
-    ws.addEventListener('close',()=>{connected=false;selfId=null;setStatus('ONLINE: RECONNECTING…');scheduleReconnect();});
-    ws.addEventListener('error',()=>{ try{ws.close()}catch{} });
+    ws.addEventListener('close',()=>{connected=false;selfId=null;pendingClaim=null;setStatus('ONLINE: RECONNECTING…');scheduleReconnect();});
+    ws.addEventListener('error',()=>{try{ws.close()}catch{}});
   }
-  function scheduleReconnect(){ clearTimeout(reconnectT); reconnectT=setTimeout(connect,2000); }
-  function ingest(p,immediate){
-    if(!p||p.id===selfId)return;
-    let r=remotes.get(p.id);
-    if(!r){
-      r={id:p.id,name:p.name||'Player',x:p.x,y:p.y,tx:p.x,ty:p.y,heading:p.heading||0,th:p.heading||0,inVehicle:!!p.inVehicle,vehicleType:p.vehicleType||null,lastSeen:performance.now()};
-      remotes.set(p.id,r);
-    }
-    r.name=p.name||r.name;r.tx=Number(p.x)||0;r.ty=Number(p.y)||0;r.th=Number(p.heading)||0;
-    r.inVehicle=!!p.inVehicle;r.vehicleType=p.vehicleType||null;r.lastSeen=performance.now();
+  function scheduleReconnect(){clearTimeout(reconnectT);reconnectT=setTimeout(connect,2000);}
+  function ingestPlayer(p,immediate){
+    if(!p||p.id===selfId)return;let r=remotes.get(p.id);
+    if(!r){r={id:p.id,name:p.name||'Player',x:p.x,y:p.y,tx:p.x,ty:p.y,heading:p.heading||0,th:p.heading||0,inVehicle:!!p.inVehicle,vehicleType:p.vehicleType||null,lastSeen:performance.now()};remotes.set(p.id,r);}
+    r.name=p.name||r.name;r.tx=Number(p.x)||0;r.ty=Number(p.y)||0;r.th=Number(p.heading)||0;r.inVehicle=!!p.inVehicle;r.vehicleType=p.vehicleType||null;r.lastSeen=performance.now();if(immediate){r.x=r.tx;r.y=r.ty;r.heading=r.th;}
+  }
+  function ingestEntities(entities,immediate){if(!entities)return;const seen=new Set();for(const v of entities.vehicles||[]){seen.add(v.id);ingestVehicle(v,immediate);}for(const id of netVehicles.keys())if(!seen.has(id))netVehicles.delete(id);}
+  function ingestVehicle(v,immediate){
+    if(!v||v.entityType!=='vehicle')return;let r=netVehicles.get(v.id);
+    if(!r){r={...v,tx:v.x,ty:v.y,th:v.heading||0,x:v.x,y:v.y,heading:v.heading||0};netVehicles.set(v.id,r);}
+    r.type=v.type;r.color=v.color||r.color;r.ownerId=v.ownerId||null;r.speed=Number(v.speed)||0;r.hp=Number(v.hp)||0;r.tx=Number(v.x)||0;r.ty=Number(v.y)||0;r.th=Number(v.heading)||0;
     if(immediate){r.x=r.tx;r.y=r.ty;r.heading=r.th;}
+    if(player.veh&&player.veh.networkId===v.id&&v.ownerId===selfId){player.veh.hp=r.hp;}
   }
+  function typeIndex(name){const i=VSPEC.findIndex(s=>s.n===name);return i>=0?i:1;}
+  function activateClaimedVehicle(v){
+    pendingClaim=null;ingestVehicle(v,true);
+    if(player.veh&&player.veh.networkId===v.id)return;
+    const mirror=makeVehicle(typeIndex(v.type),v.x,v.y,null,'player');mirror.heading=v.heading||0;mirror.speed=v.speed||0;mirror.hp=v.hp||mirror.spec.hp;mirror.col=v.color||mirror.col;mirror.networkId=v.id;mirror.networkOwned=true;mirror.plan=null;vehicles.push(mirror);player.veh=mirror;toast('Shared vehicle claimed');
+  }
+  function tryClaimNearest(){
+    if(!connected||pendingClaim)return false;let best=null,bd=68;
+    for(const v of netVehicles.values()){if(v.ownerId&&v.ownerId!==selfId)continue;const d=dist(player.x,player.y,v.x,v.y);if(d<bd){bd=d;best=v;}}
+    if(!best)return false;pendingClaim=best.id;sendMsg({type:'claimVehicle',vehicleId:best.id});return true;
+  }
+  function releaseVehicle(v){if(!v||!v.networkId)return;sendMsg({type:'releaseVehicle',vehicleId:v.networkId,speed:v.speed||0});const nv=netVehicles.get(v.networkId);if(nv)nv.ownerId=null;v.dead=true;}
   function update(dt){
-    for(const [id,r] of remotes){
-      const k=1-Math.exp(-12*dt);r.x=lerp(r.x,r.tx,k);r.y=lerp(r.y,r.ty,k);r.heading=angLerp(r.heading,r.th,k);
-      if(performance.now()-r.lastSeen>10000) remotes.delete(id);
-    }
-    if(!connected||!ws||ws.readyState!==WebSocket.OPEN)return;
-    sendAccumulator+=dt;
-    if(sendAccumulator<0.05)return;
-    sendAccumulator=0;
+    for(const [id,r] of remotes){const k=1-Math.exp(-12*dt);r.x=lerp(r.x,r.tx,k);r.y=lerp(r.y,r.ty,k);r.heading=angLerp(r.heading,r.th,k);if(performance.now()-r.lastSeen>10000)remotes.delete(id);}
+    for(const v of netVehicles.values()){if(v.ownerId===selfId)continue;const k=1-Math.exp(-10*dt);v.x=lerp(v.x,v.tx,k);v.y=lerp(v.y,v.ty,k);v.heading=angLerp(v.heading,v.th,k);}
+    if(!connected||!ws||ws.readyState!==WebSocket.OPEN)return;sendAccumulator+=dt;if(sendAccumulator<0.05)return;sendAccumulator=0;
     const v=player.veh;
-    ws.send(JSON.stringify({type:'state',x:v?v.x:player.x,y:v?v.y:player.y,heading:v?v.heading:player.a,inVehicle:!!v,vehicleType:v?v.spec.n:null}));
+    if(v&&v.networkId)sendMsg({type:'vehicleState',vehicleId:v.networkId,x:v.x,y:v.y,heading:v.heading,speed:v.speed,hp:v.hp});
+    sendMsg({type:'state',x:v?v.x:player.x,y:v?v.y:player.y,heading:v?v.heading:player.a,inVehicle:!!v,vehicleType:v?v.spec.n:null});
   }
+  function drawNetVehicle2D(v){cx.save();cx.translate(v.x,v.y);cx.rotate(v.heading);cx.fillStyle=v.color||'#7d8087';rr(-27,-13,54,26,5);cx.fill();cx.fillStyle='#19242c';rr(-8,-10,22,20,3);cx.fill();cx.restore();}
   function draw2D(){
-    for(const r of remotes.values()){
-      if(r.inVehicle){
-        cx.save();cx.translate(r.x,r.y);cx.rotate(r.heading);cx.fillStyle='#29d8c5';rr(-25,-12,50,24,5);cx.fill();cx.fillStyle='#19242c';rr(-8,-9,21,18,3);cx.fill();cx.restore();
-      }else drawGuy(r.x,r.y,r.heading,timeNow*6,'#29d8c5','#d8b08c');
-      cx.font='bold 11px Arial';cx.textAlign='center';cx.fillStyle='rgba(0,0,0,.65)';cx.fillText(r.name,r.x+1,r.y-25+1);cx.fillStyle='#fff';cx.fillText(r.name,r.x,r.y-25);
-    }
+    for(const v of netVehicles.values()){if(v.ownerId===selfId&&player.veh&&player.veh.networkId===v.id)continue;drawNetVehicle2D(v);}
+    for(const r of remotes.values()){if(r.inVehicle){cx.save();cx.translate(r.x,r.y);cx.rotate(r.heading);cx.fillStyle='#29d8c5';rr(-25,-12,50,24,5);cx.fill();cx.fillStyle='#19242c';rr(-8,-9,21,18,3);cx.fill();cx.restore();}else drawGuy(r.x,r.y,r.heading,timeNow*6,'#29d8c5','#d8b08c');cx.font='bold 11px Arial';cx.textAlign='center';cx.fillStyle='rgba(0,0,0,.65)';cx.fillText(r.name,r.x+1,r.y-25+1);cx.fillStyle='#fff';cx.fillText(r.name,r.x,r.y-25);}
   }
-  connect();
-  return {remotes,update,draw2D,get connected(){return connected}};
+  connect();return {remotes,netVehicles,update,draw2D,tryClaimNearest,releaseVehicle,get selfId(){return selfId},get connected(){return connected}};
 })();
 
 // ---------- WebGL Renderer V3.1 — chunked districts and material foundation ----------
@@ -1924,6 +1924,11 @@ const GL3D = window.GL3D = (()=>{
     for(const p of peds)if(p.state!=='dead'&&dist(p.x,p.y,cam.x,cam.y)<1050)person(p.x,p.y,p.shirt,p.skin,.9);
     for(const c of cops)if(dist(c.x,c.y,cam.x,cam.y)<1050)person(c.x,c.y,'#2c4a8c','#caa07a',.95);
     if(state!=='menu'&&!player.veh)person(player.x,player.y,'#343840','#caa07a',1);
+    // Shared server-owned vehicles.
+    for(const v of NET.netVehicles.values()){
+      if(v.ownerId===NET.selfId&&player.veh&&player.veh.networkId===v.id) continue;
+      shadow(v.x,v.y,52,26,-v.heading,.22);box(v.x,v.y,52,6,26,v.color||'#7d8087',-v.heading,3);box(v.x,v.y,22,5,18,'#202a35',-v.heading,9);
+    }
     // Remote online players. The server synchronizes position and vehicle state.
     for(const r of NET.remotes.values()){
       if(r.inVehicle){

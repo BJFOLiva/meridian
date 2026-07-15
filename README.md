@@ -133,3 +133,17 @@ The game client now connects automatically to the same host at `/ws`:
 - The top-right network badge shows connection status.
 
 Open the deployed URL in two browser windows or on two devices to test visible player synchronization.
+
+## Shared vehicle replication
+
+This build adds the first server-owned world entities: shared vehicles.
+
+- The server seeds persistent vehicle entities with stable IDs.
+- Nearby players can claim a vehicle with the normal **E** interaction.
+- Only one player can own/control a shared vehicle at a time.
+- The server validates movement distance, speed, health, and ownership.
+- Vehicle state is included in normal world snapshots and interpolated by clients.
+- Ownership is released when the driver exits or disconnects.
+- Shared vehicles render in both WebGL and Canvas 2D modes.
+
+This is the foundation for moving police, pedestrians, pickups, bullets, and explosions into the same replicated entity protocol.
